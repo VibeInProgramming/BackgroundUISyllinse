@@ -14,6 +14,8 @@ const compact = { version: 3, width: 256, height: 160, columns: 4, rows: 4, exte
 const highQuality = { version: 4, width: 512, height: 320, columns: 2, rows: 3, extension: 'jpg' };
 const ultra = { version: 5, width: 1024, height: 704, columns: 1, rows: 1, extension: 'jpg' };
 const smooth = { version: 6, width: 320, height: 208, columns: 3, rows: 4, extension: 'jpg' };
+const smoothDetail = { version: 7, width: 480, height: 320, columns: 2, rows: 3, extension: 'jpg' };
+const quality = { version: 8, width: 768, height: 512, columns: 1, rows: 2, extension: 'jpg' };
 
 function mediaFormat(bytes) {
     const signature = bytes.toString('ascii', 0, 6);
@@ -24,7 +26,7 @@ function mediaFormat(bytes) {
 
 async function makeSheets(bytes, format, preset) {
     const { version, width, height, columns, rows, extension } = preset;
-    const frameRate = version === 6 ? 60 : fps;
+    const frameRate = version === 8 ? 32 : version >= 6 ? 60 : fps;
     const frameLimit = version >= 5 ? frameRate * 4 : maxFrames;
     const folder = await mkdtemp(join(tmpdir(), 'syllinse-frames-'));
     try {
@@ -33,11 +35,13 @@ async function makeSheets(bytes, format, preset) {
         const filters = [
             'fps=' + frameRate + ':round=up',
             'trim=end_frame=' + frameLimit,
-            'scale=' + width + ':' + height + ':force_original_aspect_ratio=increase:flags=lanczos',
+            'scale=' + width + ':' + height + ':force_original_aspect_ratio=increase:flags=lanczos'
+                + (version >= 7 ? ':out_color_matrix=bt601:out_range=full' : ''),
             'crop=' + width + ':' + height,
             'setsar=1', 'showinfo', 'tile=' + columns + 'x' + rows + ':color=black',
         ].join(',');
-        const outputOptions = extension === 'jpg' ? ['-c:v', 'mjpeg', '-q:v', '2', '-pix_fmt', 'yuvj444p'] : [];
+        const outputOptions = extension === 'jpg'
+            ? ['-c:v', 'mjpeg', '-q:v', version >= 7 ? '1' : '2', '-pix_fmt', 'yuvj444p'] : [];
         const { stderr } = await run(process.env.FFMPEG || 'ffmpeg', [
             '-hide_banner', '-loglevel', 'info', '-nostdin', '-max_alloc', '67108864',
             '-threads', '1', '-protocol_whitelist', 'file', '-f', format, '-i', input,
@@ -100,10 +104,17 @@ export function createConverter() {
             const format = mediaFormat(bytes);
             if (!format) return json(res, 415, { error: 'Send an MP4, WebM or GIF file' });
             const requestedVersion = req.headers['x-syllinse-sprite-version'];
-            const quality = req.headers['x-syllinse-sprite-quality'];
-            const preset = quality === 'smooth' ? smooth : quality === 'ultra' ? ultra
-                : requestedVersion === '4' ? highQuality : compact;
+            const mode = req.headers['x-syllinse-sprite-quality'];
+            const detailRequested = req.headers['x-syllinse-sprite-detail'] === '1';
+            const qualityRequested = req.headers['x-syllinse-sprite-profile'] === 'quality';
+            let preset = mode === 'smooth' ? (detailRequested ? smoothDetail : smooth)
+                : mode === 'ultra' ? ultra : requestedVersion === '4' ? highQuality : compact;
+            if (qualityRequested) preset = quality;
             let result = await makeSheets(bytes, format, preset);
+            if (!result && (preset === quality || preset === smoothDetail)) {
+                if (preset === quality) result = await makeSheets(bytes, format, smoothDetail);
+                if (!result) result = await makeSheets(bytes, format, smooth);
+            }
             if (!result && preset.version >= 5) result = await makeSheets(bytes, format, highQuality);
             if (!result) return json(res, 422, { error: 'Sprite images are too large. Try a shorter clip.' });
             json(res, 200, result);
