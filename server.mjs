@@ -13,6 +13,7 @@ const maxFrames = fps * 8;
 const compact = { version: 3, width: 256, height: 160, columns: 4, rows: 4, extension: 'png' };
 const highQuality = { version: 4, width: 512, height: 320, columns: 2, rows: 3, extension: 'jpg' };
 const ultra = { version: 5, width: 1024, height: 704, columns: 1, rows: 1, extension: 'jpg' };
+const smooth = { version: 6, width: 320, height: 208, columns: 3, rows: 4, extension: 'jpg' };
 
 function mediaFormat(bytes) {
     const signature = bytes.toString('ascii', 0, 6);
@@ -23,13 +24,14 @@ function mediaFormat(bytes) {
 
 async function makeSheets(bytes, format, preset) {
     const { version, width, height, columns, rows, extension } = preset;
-    const frameLimit = version === 5 ? fps * 4 : maxFrames;
+    const frameRate = version === 6 ? 60 : fps;
+    const frameLimit = version >= 5 ? frameRate * 4 : maxFrames;
     const folder = await mkdtemp(join(tmpdir(), 'syllinse-frames-'));
     try {
         const input = join(folder, 'upload.bin');
         await writeFile(input, bytes);
         const filters = [
-            'fps=' + fps + ':round=up',
+            'fps=' + frameRate + ':round=up',
             'trim=end_frame=' + frameLimit,
             'scale=' + width + ':' + height + ':force_original_aspect_ratio=increase:flags=lanczos',
             'crop=' + width + ':' + height,
@@ -52,7 +54,7 @@ async function makeSheets(bytes, format, preset) {
         const encodedSize = sizes.reduce((total, file) => total + Math.ceil(file.size / 3) * 4, 0);
         if (encodedSize > 30 * 1024 * 1024) return null;
         const pages = await Promise.all(files.map(async name => (await readFile(join(folder, name))).toString('base64')));
-        return { Version: version, Fps: fps, FrameCount: frameCount, CellWidth: width, CellHeight: height,
+        return { Version: version, Fps: frameRate, FrameCount: frameCount, CellWidth: width, CellHeight: height,
             Columns: columns, Rows: rows, Pages: pages };
     } finally {
         for (const file of await readdir(folder)) await unlink(join(folder, file));
@@ -98,10 +100,11 @@ export function createConverter() {
             const format = mediaFormat(bytes);
             if (!format) return json(res, 415, { error: 'Send an MP4, WebM or GIF file' });
             const requestedVersion = req.headers['x-syllinse-sprite-version'];
-            const wantsUltra = req.headers['x-syllinse-sprite-quality'] === 'ultra';
-            const preset = wantsUltra ? ultra : requestedVersion === '4' ? highQuality : compact;
+            const quality = req.headers['x-syllinse-sprite-quality'];
+            const preset = quality === 'smooth' ? smooth : quality === 'ultra' ? ultra
+                : requestedVersion === '4' ? highQuality : compact;
             let result = await makeSheets(bytes, format, preset);
-            if (!result && preset === ultra) result = await makeSheets(bytes, format, highQuality);
+            if (!result && preset.version >= 5) result = await makeSheets(bytes, format, highQuality);
             if (!result) return json(res, 422, { error: 'Sprite images are too large. Try a shorter clip.' });
             json(res, 200, result);
         } catch {
