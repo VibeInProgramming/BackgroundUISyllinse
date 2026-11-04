@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, readdir, rmdir, unlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,10 +10,9 @@ const run = promisify(execFile);
 const maxUpload = 25 * 1024 * 1024;
 const fps = 12;
 const maxFrames = fps * 8;
-const width = 256;
-const height = 160;
-const columns = 4;
-const rows = 4;
+const compact = { version: 3, width: 256, height: 160, columns: 4, rows: 4, extension: 'png' };
+const highQuality = { version: 4, width: 512, height: 320, columns: 2, rows: 3, extension: 'jpg' };
+const ultra = { version: 5, width: 1024, height: 704, columns: 1, rows: 1, extension: 'jpg' };
 
 function mediaFormat(bytes) {
     const signature = bytes.toString('ascii', 0, 6);
@@ -22,32 +21,38 @@ function mediaFormat(bytes) {
     if (bytes.subarray(0, 4).equals(Buffer.from([26, 69, 223, 163]))) return 'matroska';
 }
 
-async function makeSheets(bytes, format) {
+async function makeSheets(bytes, format, preset) {
+    const { version, width, height, columns, rows, extension } = preset;
+    const frameLimit = version === 5 ? fps * 4 : maxFrames;
     const folder = await mkdtemp(join(tmpdir(), 'syllinse-frames-'));
     try {
         const input = join(folder, 'upload.bin');
         await writeFile(input, bytes);
         const filters = [
             'fps=' + fps + ':round=up',
-            'trim=end_frame=' + maxFrames,
-            'scale=' + width + ':' + height + ':force_original_aspect_ratio=increase',
+            'trim=end_frame=' + frameLimit,
+            'scale=' + width + ':' + height + ':force_original_aspect_ratio=increase:flags=lanczos',
             'crop=' + width + ':' + height,
             'setsar=1', 'showinfo', 'tile=' + columns + 'x' + rows + ':color=black',
         ].join(',');
+        const outputOptions = extension === 'jpg' ? ['-c:v', 'mjpeg', '-q:v', '2', '-pix_fmt', 'yuvj444p'] : [];
         const { stderr } = await run(process.env.FFMPEG || 'ffmpeg', [
             '-hide_banner', '-loglevel', 'info', '-nostdin', '-max_alloc', '67108864',
             '-threads', '1', '-protocol_whitelist', 'file', '-f', format, '-i', input,
             '-map', '0:v:0', '-an', '-sn', '-dn', '-filter_threads', '1', '-vf', filters,
-            '-fps_mode', 'passthrough', '-threads:v', '1', join(folder, 'sheet-%03d.png'),
+            '-fps_mode', 'passthrough', '-threads:v', '1', ...outputOptions, join(folder, 'sheet-%03d.' + extension),
         ], { timeout: 22_000, maxBuffer: 512 * 1024, windowsHide: true });
         const matches = [...stderr.matchAll(/showinfo[^\r\n]*?\bn:\s*(\d+)/g)];
         const frameCount = Number(matches.at(-1)?.[1]) + 1;
-        const files = (await readdir(folder)).filter(name => /^sheet-\d+\.png$/.test(name)).sort();
-        if (!frameCount || frameCount > maxFrames || files.length !== Math.ceil(frameCount / (columns * rows))) {
+        const files = (await readdir(folder)).filter(name => name.startsWith('sheet-') && name.endsWith('.' + extension)).sort();
+        if (!frameCount || frameCount > frameLimit || files.length !== Math.ceil(frameCount / (columns * rows))) {
             throw new Error('Could not determine sprite frame count');
         }
+        const sizes = await Promise.all(files.map(name => stat(join(folder, name))));
+        const encodedSize = sizes.reduce((total, file) => total + Math.ceil(file.size / 3) * 4, 0);
+        if (encodedSize > 30 * 1024 * 1024) return null;
         const pages = await Promise.all(files.map(async name => (await readFile(join(folder, name))).toString('base64')));
-        return { Version: 3, Fps: fps, FrameCount: frameCount, CellWidth: width, CellHeight: height,
+        return { Version: version, Fps: fps, FrameCount: frameCount, CellWidth: width, CellHeight: height,
             Columns: columns, Rows: rows, Pages: pages };
     } finally {
         for (const file of await readdir(folder)) await unlink(join(folder, file));
@@ -92,7 +97,13 @@ export function createConverter() {
             const bytes = Buffer.concat(parts, received);
             const format = mediaFormat(bytes);
             if (!format) return json(res, 415, { error: 'Send an MP4, WebM or GIF file' });
-            json(res, 200, await makeSheets(bytes, format));
+            const requestedVersion = req.headers['x-syllinse-sprite-version'];
+            const wantsUltra = req.headers['x-syllinse-sprite-quality'] === 'ultra';
+            const preset = wantsUltra ? ultra : requestedVersion === '4' ? highQuality : compact;
+            let result = await makeSheets(bytes, format, preset);
+            if (!result && preset === ultra) result = await makeSheets(bytes, format, highQuality);
+            if (!result) return json(res, 422, { error: 'Sprite images are too large. Try a shorter clip.' });
+            json(res, 200, result);
         } catch {
             if (!res.destroyed && !res.headersSent) json(res, 422, { error: 'Could not convert this clip. Try a shorter or smaller file.' });
         } finally {
