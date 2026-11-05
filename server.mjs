@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, readdir, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -66,6 +67,82 @@ async function makeSheets(bytes, format, preset) {
     }
 }
 
+async function makeLoopSheets(bytes, format) {
+    const folder = await mkdtemp(join(tmpdir(), 'syllinse-loop-'));
+    try {
+        const input = join(folder, 'upload.bin');
+        await writeFile(input, bytes);
+        const probe = await run(process.env.FFPROBE || 'ffprobe', [
+            '-v', 'error', '-protocol_whitelist', 'file', '-f', format, '-i', input,
+            '-select_streams', 'v:0', '-show_entries', 'stream=avg_frame_rate,r_frame_rate,duration:format=duration',
+            '-of', 'json',
+        ], { timeout: 5000, maxBuffer: 1024 * 1024, windowsHide: true });
+        const info = JSON.parse(probe.stdout);
+        const stream = info.streams?.[0];
+        const fraction = value => {
+            const [a, b = 1] = String(value).split('/').map(Number);
+            return Number.isFinite(a / b) && a / b > 0 ? a / b : 0;
+        };
+        const frameRate = Math.min(32, fraction(stream?.avg_frame_rate) || fraction(stream?.r_frame_rate) || 24);
+        const sourceDuration = Number(stream?.duration) || Number(info.format?.duration);
+        if (!Number.isFinite(sourceDuration) || sourceDuration <= 0) throw new Error('Unknown clip duration');
+        const totalFrames = Math.max(1, Math.floor(Math.min(sourceDuration, 8) * frameRate));
+        const blendFrames = Math.min(Math.max(1, Math.round(frameRate * 0.2)), Math.floor(totalFrames / 4));
+        const outputFrames = totalFrames - blendFrames;
+        const profiles = [
+            { width: 512, height: 336, columns: 2, rows: 3 },
+            { width: 480, height: 320, columns: 2, rows: 3 },
+            { width: 384, height: 240, columns: 2, rows: 4 },
+            { width: 320, height: 208, columns: 3, rows: 4 },
+        ];
+        const profile = profiles.find(p => Math.ceil(outputFrames / (p.columns * p.rows))
+            * p.width * p.height * p.columns * p.rows <= 24 * 1024 * 1024);
+        if (!profile) throw new Error('Loop exceeds texture budget');
+        const { width, height, columns, rows } = profile;
+        const base = '[0:v]fps=' + frameRate + ':round=up,trim=end_frame=' + totalFrames
+            + ',scale=' + width + ':' + height + ':force_original_aspect_ratio=increase:flags=lanczos'
+            + ':out_color_matrix=bt601:out_range=full,crop=' + width + ':' + height
+            + ',setsar=1,format=yuv444p,settb=AVTB,setpts=PTS-STARTPTS';
+        let filter;
+        if (blendFrames > 0) {
+            filter = base + ',split=3[mid][tail][head];'
+                + '[mid]trim=start_frame=' + blendFrames + ':end_frame=' + (totalFrames - blendFrames) + ',setpts=PTS-STARTPTS[m];'
+                + '[tail]trim=start_frame=' + (totalFrames - blendFrames) + ':end_frame=' + totalFrames + ',setpts=PTS-STARTPTS[t];'
+                + '[head]trim=end_frame=' + blendFrames + ',setpts=PTS-STARTPTS[h];'
+                + '[t][h]xfade=transition=fade:duration=' + (blendFrames / frameRate) + ':offset=0[join];'
+                + '[m][join]concat=n=2:v=1:a=0,fps=' + frameRate + ':round=near,trim=end_frame=' + outputFrames;
+        } else {
+            filter = base;
+        }
+        filter += ',showinfo,tile=' + columns + 'x' + rows + ':color=black[out]';
+        const { stderr } = await run(process.env.FFMPEG || 'ffmpeg', [
+            '-hide_banner', '-loglevel', 'info', '-nostdin', '-threads', '1', '-protocol_whitelist', 'file',
+            '-f', format, '-i', input, '-filter_complex_threads', '1', '-filter_complex', filter,
+            '-map', '[out]', '-an', '-sn', '-dn', '-fps_mode', 'passthrough',
+            '-c:v', 'mjpeg', '-q:v', '1', '-pix_fmt', 'yuvj444p', '-threads:v', '1', join(folder, 'sheet-%03d.jpg'),
+        ], { timeout: 30_000, maxBuffer: 1024 * 1024, windowsHide: true });
+        const matches = [...stderr.matchAll(/showinfo[^\r\n]*?\bn:\s*(\d+)/g)];
+        const frameCount = Number(matches.at(-1)?.[1]) + 1;
+        const files = (await readdir(folder)).filter(name => /^sheet-\d+\.jpg$/.test(name)).sort();
+        if (!frameCount || frameCount > totalFrames || files.length !== Math.ceil(frameCount / (columns * rows))) {
+            throw new Error('Invalid converted loop');
+        }
+        const sizes = await Promise.all(files.map(name => stat(join(folder, name))));
+        if (sizes.reduce((sum, file) => sum + Math.ceil(file.size / 3) * 4, 0) > 30 * 1024 * 1024) {
+            throw new Error('Loop images exceed transfer budget');
+        }
+        return {
+            Version: 9, Fps: frameRate, FrameCount: frameCount, CellWidth: width, CellHeight: height,
+            Columns: columns, Rows: rows,
+            Pages: await Promise.all(files.map(async file => (await readFile(join(folder, file))).toString('base64'))),
+            Duration: frameCount / frameRate, SourceDuration: sourceDuration, LoopBlendFrames: blendFrames,
+        };
+    } finally {
+        for (const file of await readdir(folder)) await unlink(join(folder, file));
+        await rmdir(folder);
+    }
+}
+
 function json(res, status, value) {
     res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify(value));
@@ -73,8 +150,10 @@ function json(res, status, value) {
 
 export function createConverter() {
     let busy = false;
+    const cache = new Map();
+    let cacheBytes = 0;
     const server = createServer(async (req, res) => {
-        if (req.method === 'GET' && req.url === '/health') return json(res, 200, { ok: true });
+        if (req.method === 'GET' && req.url === '/health') return json(res, 200, { ok: true, loopVersion: 9 });
         if (req.method !== 'POST' || req.url !== '/frames') return json(res, 404, { error: 'Use POST /frames' });
         if (req.headers['content-type'] !== 'application/octet-stream') {
             return json(res, 415, { error: 'Send the video bytes as application/octet-stream' });
@@ -103,6 +182,33 @@ export function createConverter() {
             const bytes = Buffer.concat(parts, received);
             const format = mediaFormat(bytes);
             if (!format) return json(res, 415, { error: 'Send an MP4, WebM or GIF file' });
+            if (req.headers['x-syllinse-sprite-loop'] === '1') {
+                const key = createHash('sha256').update(bytes).update('loop-v9').digest('hex');
+                let body = cache.get(key);
+                res.setHeader('X-Syllinse-Cache', body ? 'hit' : 'miss');
+                if (!body) {
+                    let result;
+                    try {
+                        result = await makeLoopSheets(bytes, format);
+                    } catch {
+                        // Keep unusual containers playable if their timing metadata cannot be read.
+                        result = await makeSheets(bytes, format, highQuality);
+                    }
+                    if (!result) return json(res, 422, { error: 'Loop images are too large. Try a shorter clip.' });
+                    body = JSON.stringify(result);
+                    const size = Buffer.byteLength(body);
+                    while (cacheBytes + size > 64 * 1024 * 1024 && cache.size) {
+                        const oldest = cache.keys().next().value;
+                        cacheBytes -= Buffer.byteLength(cache.get(oldest));
+                        cache.delete(oldest);
+                    }
+                    cache.set(key, body);
+                    cacheBytes += size;
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+                res.end(body);
+                return;
+            }
             const requestedVersion = req.headers['x-syllinse-sprite-version'];
             const mode = req.headers['x-syllinse-sprite-quality'];
             const detailRequested = req.headers['x-syllinse-sprite-detail'] === '1';
